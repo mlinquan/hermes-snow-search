@@ -30,6 +30,10 @@ Data lives in RAM from startup. No disk I/O, no serial waits. Just one parallel 
 
 Silent background load — no terminal output. Data is ready before the first `snow_search` call.
 
+> **Memory note:** Each Hermes instance loads its own copy. CLI and Gateway
+> run as separate processes, so memory usage can reach 2× your configured
+> `memory_limit_mb` (e.g. 40 MB total if set to 20 MB).
+
 On first use, the terminal shows:
 
 ```
