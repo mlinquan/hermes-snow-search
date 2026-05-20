@@ -1,5 +1,5 @@
 name: hermes-snow-search
-version: 0.3.0
+version: 0.3.1
 description: "In-memory parallel search — sessions, holographic facts, built-in memory (currently supports holographic; other memory providers TBD)"
 author: "LinQuan & Snow (AI Girl)"
 
