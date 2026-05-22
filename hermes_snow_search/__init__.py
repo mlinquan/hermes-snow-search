@@ -32,6 +32,7 @@ def register(ctx) -> None:
     )
     ctx.register_hook("pre_llm_call", _engine.on_pre_llm_call)
     ctx.register_hook("post_tool_call", _engine.on_post_tool_call)
+    ctx.register_hook("post_llm_call", _engine.on_post_llm_call)
 
     # Background eager load with terminal progress
     def _eager_load():

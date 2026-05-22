@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-snow-search"
-version = "0.3.1"
+version = "0.4.0"
 description = "In-memory parallel search — sessions, holographic facts, built-in memory (currently supports holographic; other memory providers TBD)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,3 +18,6 @@ hermes-snow-search = "hermes_snow_search"
 
 [project.urls]
 Homepage = "https://github.com/mlinquan/hermes-snow-search"
+
+[tool.setuptools.packages.find]
+include = ["hermes_snow_search*"]

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -54,23 +55,49 @@ _DEFAULT_DEEP_LOAD_MODE = "ondemand"  # "startup" | "ondemand"
 SNOW_SEARCH_SCHEMA = {
     "name": "snow_search",
     "description": (
-        "High-speed parallel memory search across ALL available stores (session history, "
-        "holographic facts, and built-in memory). All data is cached in RAM — results "
-        "return in <1ms. Use this FIRST when the user asks about past conversations, "
-        "preferences, or anything you might have discussed before. Falls back to empty "
-        "results silently when a store is unavailable. Supports fuzzy keyword matching."
+        "Fast in-memory search across ALL stores: session history, holographic facts, "
+        "built-in memory, and skill metadata. Cached in RAM — results in <1ms. Use this "
+        "FIRST for any recall: past conversations, preferences, decisions, project context."
         "\n\n"
-        "When to use vs session_search / fact_store:"
-        "\n- snow_search: broad recall, \"what do I know about X\" — searches everything at once"
-        "\n- session_search: deep drill into a specific session (scroll, bookends, FTS5)"
-        "\n- fact_store: structured CRUD (add facts, probe entities, reason across entities)"
+        "IMPORTANT — store roles:"
+        "\n- snow_search: the ONLY tool for READING/searching memory. Always use this first."
+        "\n- memory: WRITE-ONLY tool for saving memories. Never use memory to read/search."
+        "\n- fact_store: WRITE-ONLY tool for managing structured facts. Never use fact_store to read/search."
+        "\n\nSkills cache: ~/.hermes/skills/**/SKILL.md frontmatter (name, description, tags) "
+        "is pre-loaded on startup. Use snow_search to discover skills — never use filesystem reads."
+        "\n\n"
+        "Action modes:"
+        "\n- action=search (default): run a query across all stores"
+        "\n- action=reload: clear and reload the entire search index"
+        "\n- action=status: get current index statistics (zero I/O)"
+        "\n\n"
+        "Guidance: When user says \"snow reload\" or asks to reload/refresh the index, "
+        "pass action=reload. When user says \"snow status\" or asks for index stats, "
+        "pass action=status. Queries about reloading/status of other things "
+        "(e.g. \"how to reload nginx\") are normal searches — only route when "
+        "intent is clearly about the search index itself."
+        "\n\n"
+        "Deep search: deep=true searches full message bodies. Check search_info.full_coverage "
+        "— if false, fall back to session_search for older sessions."
+        "\n\n"
+        "Retrieval rule: Check search_info.full_coverage — if true, snow_search covers "
+        "everything. If false or absent, session_search may be needed for older sessions. "
+        "For ANY recall question, ALWAYS call this tool with relevant search terms. "
+        "Do NOT call session_search for retrieval — it only scrolls into already-identified "
+        "sessions. Never call memory or fact_store for reads — they are write-only."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["search", "reload", "status"],
+                "description": "Operation mode. Default 'search' runs a query. Use 'reload' to rebuild the index from disk, 'status' for zero-I/O index statistics.",
+                "default": "search",
+            },
             "query": {
                 "type": "string",
-                "description": "Search query — keywords, partial matches supported.",
+                "description": "Search query — keywords, partial matches supported. Required for action=search.",
             },
             "limit_per_source": {
                 "type": "integer",
@@ -92,6 +119,16 @@ SNOW_SEARCH_SCHEMA = {
                 "description": "Include built-in memory entries in search (default: true).",
                 "default": True,
             },
+            "include_skills": {
+                "type": "boolean",
+                "description": "Include cached skill metadata in search (default: true). Skills are loaded from ~/.hermes/skills/*/SKILL.md frontmatter.",
+                "default": True,
+            },
+            "include_soul": {
+                "type": "boolean",
+                "description": "Include SOUL.md content in search (default: true). Profile-isolated: ~/.hermes/SOUL.md or ~/.hermes/profiles/<name>/SOUL.md.",
+                "default": True,
+            },
             "deep": {
                 "type": "boolean",
                 "description": "Search full message bodies instead of session summaries. Requires deep search index (loaded on first use). Default: false.",
@@ -104,7 +141,7 @@ SNOW_SEARCH_SCHEMA = {
                 "default": "relevance",
             },
         },
-        "required": ["query"],
+        "required": [],
     },
 }
 
@@ -163,6 +200,9 @@ class SnowSearchEngine:
         self._fact_max = config.get("fact_max", _DEFAULT_FACT_MAX)
         self._memory_max = config.get("memory_max", _DEFAULT_MEMORY_MAX)
 
+        # --- profile detection ---
+        self._profile = os.environ.get("HERMES_PROFILE") or config.get("orchestrator_profile") or None
+
         # --- deep search config ---
         self._deep_enabled = config.get("deep_search_enabled", _DEFAULT_DEEP_ENABLED)
         self._deep_mode = config.get("deep_search_load_mode", _DEFAULT_DEEP_LOAD_MODE)
@@ -174,6 +214,9 @@ class SnowSearchEngine:
         self._sessions: list[dict] = []  # title, session_id, last_active, preview
         self._facts: list[dict] = []  # fact_id, content, trust_score, category, tags
         self._memory_entries: list[dict] = []  # source (MEMORY.md/USER.md), content
+        self._skills: list[dict] = []  # name, description, tags, category (from SKILL.md)
+        self._soul: list[dict] = []  # SOUL.md content (profile-isolated)
+        self._soul_mtime: float = 0.0  # last loaded mtime
 
         self._current_bytes = 0
 
@@ -185,6 +228,7 @@ class SnowSearchEngine:
         self._deep_earliest_ts = 0.0
         self._deep_latest_ts = 0.0
         self._deep_max_message_id = 0  # highest message id loaded
+        self._full_coverage: bool = False  # True when all sessions loaded into deep index
 
         # --- holographic availability (checked once) ---
         self._holographic_available: bool | None = None
@@ -206,6 +250,21 @@ class SnowSearchEngine:
         except Exception:
             return {}
 
+    def _resolve_data_path(self, *parts: str) -> "pathlib.PurePath":
+        """Resolve a data path respecting profile isolation.
+
+        If a profile is active, paths resolve under profiles/<name>/.
+        Otherwise they resolve under the Hermes home root.
+        """
+        from hermes_constants import get_hermes_home
+        import pathlib
+        home = get_hermes_home()
+        if self._profile:
+            base = home / "profiles" / self._profile
+        else:
+            base = home
+        return base.joinpath(*parts)
+
     # -- load -----------------------------------------------------------------
 
     def _ensure_loaded(self) -> None:
@@ -219,10 +278,12 @@ class SnowSearchEngine:
                 self._load_all()
                 self._ready = True
                 logger.info(
-                    "snow-search loaded: %d sessions, %d facts, %d memory entries, ~%d MB",
+                    "snow-search loaded: %d sessions, %d facts, %d memory, %d skills, %d soul, ~%d MB",
                     len(self._sessions),
                     len(self._facts),
                     len(self._memory_entries),
+                    len(self._skills),
+                    len(self._soul),
                     self._current_bytes // (1024 * 1024),
                 )
             except Exception as e:
@@ -259,6 +320,15 @@ class SnowSearchEngine:
         facts = self._load_facts()
         total += _estimate_bytes(facts)
         self._facts = facts
+
+        skills = self._load_skills()
+        total += _estimate_bytes(skills)
+        self._skills = skills
+
+        soul = self._load_soul()
+        total += _estimate_bytes(soul)
+        self._soul = soul
+
         self._current_bytes = total
 
     def _ensure_deep_loaded(self) -> None:
@@ -469,8 +539,10 @@ class SnowSearchEngine:
 
         # Full coverage indicator
         if self._deep_total_sessions >= total:
+            self._full_coverage = True
             _emit(f"All chat data loaded -- full coverage, no eviction")
         else:
+            self._full_coverage = False
             pct_loaded = self._deep_total_sessions / total * 100 if total > 0 else 0
             _emit(f"Memory cap reached -- {self._deep_total_sessions}/{total} sessions loaded ({pct_loaded:.0f}%), oldest evicted")
 
@@ -568,20 +640,67 @@ class SnowSearchEngine:
             self._holographic_available = False
             return []
 
-    def _load_memory(self) -> list[dict]:
-        """Load built-in memory entries from MEMORY.md and USER.md."""
+    def _load_skills(self) -> list[dict]:
+        """Scan ~/.hermes/skills/**/SKILL.md recursively and extract frontmatter metadata."""
         results = []
         try:
             from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            memories_dir = home / "memories"
+            skills_dir = get_hermes_home() / "skills"
+            if not skills_dir.is_dir():
+                return results
+            for skill_md in sorted(skills_dir.rglob("SKILL.md")):
+                try:
+                    text = skill_md.read_text(encoding="utf-8", errors="replace")
+                    fm = self._parse_frontmatter(text)
+                    if not fm:
+                        continue
+                    skill_dir = skill_md.parent
+                    if skill_dir.parent == skills_dir:
+                        category = skill_dir.name
+                    else:
+                        category = skill_dir.parent.name
+                    name = fm.get("name", skill_dir.name)
+                    desc = fm.get("description", "")
+                    tags = []
+                    metadata = fm.get("metadata", {}) or {}
+                    hermes_md = metadata.get("hermes", {}) or {}
+                    raw_tags = hermes_md.get("tags", []) or []
+                    tags = [t for t in raw_tags if isinstance(t, str)]
+                    results.append({
+                        "name": name,
+                        "description": desc,
+                        "tags": tags,
+                        "category": category,
+                    })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("snow-search skills load failed: %s", e)
+        return results
 
+    @staticmethod
+    def _parse_frontmatter(text: str) -> dict | None:
+        """Extract YAML frontmatter between --- delimiters."""
+        if not text.startswith("---"):
+            return None
+        end = text.find("---", 3)
+        if end == -1:
+            return None
+        try:
+            import yaml
+            return yaml.safe_load(text[3:end]) or {}
+        except Exception:
+            return None
+
+    def _load_memory(self) -> list[dict]:
+        """Load built-in memory entries from MEMORY.md and USER.md (profile-isolated)."""
+        results = []
+        try:
             for source in ("MEMORY.md", "USER.md"):
-                path = memories_dir / source
+                path = self._resolve_data_path("memories", source)
                 if not path.exists():
                     continue
                 text = path.read_text(encoding="utf-8", errors="replace")
-                # Entries are delimited by §
                 entries = [e.strip() for e in text.split("§") if e.strip()]
                 for entry in entries[:self._memory_max]:
                     results.append({
@@ -591,6 +710,40 @@ class SnowSearchEngine:
         except Exception as e:
             logger.debug("snow-search memory load failed: %s", e)
         return results
+
+    def _load_soul(self) -> list[dict]:
+        """Load SOUL.md content (profile-isolated). Single document, no § delimiter."""
+        results = []
+        try:
+            path = self._resolve_data_path("SOUL.md")
+            if not path.exists():
+                return results
+            self._soul_mtime = path.stat().st_mtime
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                results.append({
+                    "source": "SOUL.md",
+                    "content": text,
+                })
+        except Exception as e:
+            logger.debug("snow-search soul load failed: %s", e)
+        return results
+
+    def _refresh_soul_if_changed(self) -> None:
+        """Reload SOUL.md if modified since last load."""
+        try:
+            path = self._resolve_data_path("SOUL.md")
+            if not path.exists():
+                if self._soul:
+                    self._soul = []
+                    self._soul_mtime = 0.0
+                return
+            mtime = path.stat().st_mtime
+            if mtime == self._soul_mtime:
+                return
+            self._soul = self._load_soul()
+        except Exception:
+            pass
 
     # -- search ---------------------------------------------------------------
 
@@ -605,7 +758,16 @@ class SnowSearchEngine:
         include_sessions = args.get("include_sessions", True)
         include_facts = args.get("include_facts", True)
         include_memory = args.get("include_memory", True)
+        include_skills = args.get("include_skills", True)
+        include_soul = args.get("include_soul", True)
         deep = args.get("deep", False)
+
+        # Action routing
+        action = args.get("action", "search")
+        if action == "reload":
+            return self._reload()
+        elif action == "status":
+            return self._status()
 
         if deep:
             # Deep mode: load full message bodies + facts + memory (skip sessions)
@@ -627,6 +789,8 @@ class SnowSearchEngine:
                     "facts": bool(self._facts),
                     "memory": bool(self._memory_entries),
                     "deep_messages": bool(self._deep_messages),
+                    "skills": bool(self._skills),
+                    "soul": bool(self._soul),
                 },
                 "message": "No query provided. Use query= to search across all stores.",
             })
@@ -658,6 +822,10 @@ class SnowSearchEngine:
             stores["facts"] = self._facts
         if include_memory and self._memory_entries:
             stores["memory"] = self._memory_entries
+        if include_skills and self._skills:
+            stores["skills"] = self._skills
+        if include_soul and self._soul:
+            stores["soul"] = self._soul
 
         if not stores:
             return json.dumps({
@@ -707,6 +875,7 @@ class SnowSearchEngine:
         # Search coverage metadata
         search_info = {
             "sessions_scanned": len(self._sessions) if not deep and self._sessions else self._deep_total_sessions if deep and self._deep_messages else 0,
+            "full_coverage": getattr(self, "_full_coverage", False),
         }
         if deep and self._deep_messages:
             search_info["messages_scanned"] = len(self._deep_messages)
@@ -748,6 +917,12 @@ class SnowSearchEngine:
                         entry["session_id"] = item.get("session_id", "")
                         entry["timestamp"] = item.get("timestamp", 0)
                         entry["role"] = item.get("role", "")
+                    elif store_name == "skills":
+                        entry["name"] = item.get("name", "")
+                        entry["category"] = item.get("category", "")
+                        entry["tags"] = item.get("tags", [])
+                    elif store_name == "soul":
+                        entry["source"] = item.get("source", "")
                     scored.append(entry)
 
             scored.sort(key=lambda x: -x["score"])
@@ -791,6 +966,19 @@ class SnowSearchEngine:
                 score += 0.2
             return score
 
+        elif store == "skills":
+            name = item.get("name", "")
+            desc = item.get("description", "")
+            tags = " ".join(item.get("tags", []))
+            score = _match_score(tokens, name) * 4.0
+            score += _match_score(tokens, desc) * 2.0
+            score += _match_score(tokens, tags) * 3.0
+            return score
+
+        elif store == "soul":
+            content = item.get("content", "")
+            return _match_score(tokens, content) * 1.5
+
         return 0.0
 
     @staticmethod
@@ -804,6 +992,10 @@ class SnowSearchEngine:
             return item.get("content", "")
         elif store == "deep_messages":
             return item.get("content_preview", item.get("content", ""))
+        elif store == "skills":
+            return f"{item.get('name', '')}: {item.get('description', '')}"
+        elif store == "soul":
+            return item.get("content", "")[:500]
         return ""
 
     # -- incremental updates via hooks ----------------------------------------
@@ -835,6 +1027,9 @@ class SnowSearchEngine:
                     self._on_memory_added(args)
                 elif action in ("replace", "remove"):
                     self._on_memory_removed_or_replaced(args)
+
+            # Check SOUL.md for external edits
+            self._refresh_soul_if_changed()
         except Exception:
             pass  # Never let a hook crash the agent loop
 
@@ -959,6 +1154,18 @@ class SnowSearchEngine:
             self._evict()
         return None  # No context injection needed
 
+    def on_post_llm_call(self, **kwargs) -> None:
+        """Clear snow_search results from conversation history to save context tokens."""
+        history = kwargs.get("conversation_history")
+        if not history:
+            return
+        for msg in history:
+            if msg.get("role") != "tool":
+                continue
+            name = msg.get("name") or msg.get("tool_name") or ""
+            if name == "snow_search":
+                msg["content"] = ""
+
     def _evict(self) -> None:
         """Evict least valuable entries until under threshold."""
         target = int(self._memory_limit * 0.6)
@@ -978,9 +1185,81 @@ class SnowSearchEngine:
             _estimate_bytes(self._sessions)
             + _estimate_bytes(self._facts)
             + _estimate_bytes(self._memory_entries)
+            + _estimate_bytes(self._skills)
         )
 
-    # -- reload ---------------------------------------------------------------
+    # -- reload / status ------------------------------------------------------
+
+    def _reload(self) -> str:
+        """Clear all data, reload from DB, return full status JSON."""
+        with self._lock:
+            self._ready = False
+            self._deep_ready = False
+            self._sessions = []
+            self._facts = []
+            self._memory_entries = []
+            self._current_bytes = 0
+            self._deep_messages = []
+            self._deep_bytes = 0
+            self._skills = []
+            self._soul = []
+            self._holographic_available = None
+
+        _emit("Reloading snow search index...")
+        self._load_all()
+        self._ready = True
+
+        if self._deep_enabled:
+            try:
+                self._load_deep()
+                self._deep_ready = True
+            except Exception as e:
+                _emit(f"Deep reload failed: {e}")
+
+        _emit("Reload complete")
+        return self._status()
+
+    def _status(self) -> str:
+        """Return current index state — zero I/O, memory-only."""
+        import datetime
+
+        counts = {
+            "sessions": len(self._sessions),
+            "facts": len(self._facts),
+            "memory": len(self._memory_entries),
+            "deep_messages": len(self._deep_messages),
+            "skills": len(self._skills),
+            "soul": len(self._soul),
+        }
+
+        memory_mb = {
+            "current_mb": round(self._current_bytes / (1024 * 1024), 1),
+            "deep_mb": round(self._deep_bytes / (1024 * 1024), 1),
+        }
+
+        coverage = {
+            "full_coverage": getattr(self, "_full_coverage", False),
+        }
+        if self._deep_earliest_ts < float("inf") and self._deep_latest_ts > 0:
+            coverage["date_range"] = (
+                f"{datetime.datetime.fromtimestamp(self._deep_earliest_ts).strftime('%b %d')}"
+                f" ~ {datetime.datetime.fromtimestamp(self._deep_latest_ts).strftime('%b %d')}"
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "action": "status",
+                "counts": counts,
+                "memory": memory_mb,
+                "coverage": coverage,
+                "ready": self._ready,
+                "deep_ready": self._deep_ready,
+            },
+            ensure_ascii=False,
+        )
+
+    # -- reload (public) ------------------------------------------------------
 
     def reload(self) -> str:
         """Force a full reload of all stores. Usable from /snow-reload command."""
