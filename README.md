@@ -87,7 +87,7 @@ plugins:
     memory_limit_mb: 500          # cap for lightweight stores (sessions/facts/memory/skills)
     session_max: 7000
     fact_max: 10000
-    deep_search_enabled: true     # set false to disable deep search
+    deep_search_load_mode: startup  # off | startup | ondemand
 ```
 
 | Key | Default | Description |
@@ -95,7 +95,7 @@ plugins:
 | `memory_limit_mb` | 500 | Cap for lightweight stores. Deep search uses FTS5 (DB-side) and doesn't count against this |
 | `session_max` | 7000 | Max session entries in lightweight cache |
 | `fact_max` | 10000 | Max fact entries in cache |
-| `deep_search_enabled` | true | Enables full message-body search via FTS5 |
+| `deep_search_load_mode` | `startup` | Deep search behavior: `off` (disabled), `startup` (preload at boot), `ondemand` (lazy on first query) |
 
 > `memory_limit_mb` applies to lightweight stores only. Deep search queries the existing FTS5 index in the database — zero additional RAM.
 
@@ -107,7 +107,7 @@ After every LLM response, the `post_llm_call` hook clears snow_search tool outpu
 
 ## Deep Search
 
-Enabled by default (`deep_search_enabled: true`). Queries the existing FTS5 index in the database for full message-body search — no load step, no memory overhead. Results include `session_id`, `timestamp`, `role`, `snippet`, and `search_info`.
+Enabled by default (`deep_search_load_mode: startup`). Queries the existing FTS5 index in the database for full message-body search — no load step, no memory overhead. Results include `session_id`, `timestamp`, `role`, `snippet`, and `search_info`.
 
 ### FTS5 routing
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.0] — 2026-06-27
+
+### Fixed
+- **`_deep_mode` AttributeError crashed the startup eager-load thread** — v0.6.0 removed the `deep_search_load_mode` config and the `_deep_mode` attribute, but `__init__.py` still referenced `_engine._deep_mode == "startup"`. Restored `deep_search_load_mode` (`off` | `startup` | `ondemand`, default `startup`) and derived `_deep_enabled` / `_deep_mode` from it.
+- **`role_filter='tool'` always returned empty results** — the FTS/LIKE WHERE clauses hard-coded `m.role IN ('user','assistant')` *and* appended `m.role = ?`, so a `tool` filter contradicted itself. Reworked into mutually exclusive branches: an explicit `role_filter` wins; otherwise the default excludes tool output.
+- **`stores_available.deep_messages` falsely reported `false` in FTS mode** — used `bool(self._deep_messages)`, which is empty when deep data lives in the DB. Now reflects `_deep_enabled and (_use_fts or ...)`.
+- **Deep path never loaded sessions / skills / soul** — `handle_search(deep=True)` only called `_ensure_facts_and_memory()`, relying entirely on the background eager-load thread; if it failed or was slow these stores stayed empty forever. Added an `_ensure_loaded()` fallback in the query path.
+
+### Added
+- **Empty query + time range** — snow_search now accepts an empty `query` together with `start_timestamp` / `end_timestamp` to browse a time window. New `_search_deep_range` scans by timestamp + role with no MATCH/LIKE predicate.
+
+### Changed
+- **Removed `deep_search_enabled` config** — redundant with `deep_search_load_mode: off`. Behavior is now controlled by a single key: `off` (disabled) / `startup` (preload at boot) / `ondemand` (lazy on first query).
+- Schema descriptions updated: `query` notes it may be empty with a range; `role_filter` documents the default excludes tool output; `relevance` sort notes it falls back to time order on empty queries.
+
+### Documentation
+- README / README_CN config tables updated for `deep_search_load_mode` (removed `deep_search_enabled`).
+
 ## [0.6.1] — 2026-06-26
 
 ### Added

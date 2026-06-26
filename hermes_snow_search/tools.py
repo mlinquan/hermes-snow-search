@@ -46,7 +46,8 @@ _DEFAULT_FACT_MAX = 10000
 _DEFAULT_MEMORY_MAX = 100
 
 # Deep search
-_DEFAULT_DEEP_ENABLED = True
+# deep_search_load_mode: "off" (disabled) | "startup" (preload at boot) | "ondemand" (lazy on first query)
+_DEFAULT_DEEP_LOAD_MODE = "startup"
 
 # Source priority — primary sort key across all sort modes.
 # Intent: soul/memory (persistent identity + user facts) outrank holographic
@@ -91,7 +92,7 @@ SNOW_SEARCH_SCHEMA = {
         "Role filter:"
         "\n- role_filter='user': only messages the USER sent. Use when user asks 'what did I say' or 'did I mention'."
         "\n- role_filter='assistant': only messages the ASSISTANT/agent said. Use when user asks 'what did you say' or 'did you tell me'."
-        "\n- Omit role_filter to search both sides."
+        "\n- Omit role_filter to search user + assistant (tool output excluded by default)."
         "\n\n"
         "IMPORTANT — store roles:"
         "\n- snow_search: the ONLY tool for READING/searching memory. Always use this first."
@@ -119,7 +120,8 @@ SNOW_SEARCH_SCHEMA = {
         "\n- newest (default): latest timestamp first. Best for 'recent / last time / yesterday / just now' questions."
         "\n- oldest: earliest first. Use when user asks about first / earliest / original / at that time. "
         "Pass sort=oldest explicitly — do NOT rely on relevance sort for first-occurrence questions."
-        "\n- relevance: best score first. Use when query is a fuzzy keyword search with no time intent."
+        "\n- relevance: best score first. Use when query is a fuzzy keyword search with no time intent. "
+        "Falls back to time order when query is empty (range-browsing a window)."
         "\n\n"
         "Retrieval rule: Do NOT call session_search after snow_search — session_search "
         "is for scrolling into an already-identified session, not for re-querying. "
@@ -139,7 +141,7 @@ SNOW_SEARCH_SCHEMA = {
             },
             "query": {
                 "type": "string",
-                "description": "Search query — keywords, partial matches supported. Required for action=search.",
+                "description": "Search query — keywords, partial matches supported. May be empty when combined with start_timestamp/end_timestamp to browse a time window. Otherwise required for action=search.",
             },
             "limit_per_source": {
                 "type": "integer",
@@ -193,7 +195,7 @@ SNOW_SEARCH_SCHEMA = {
             "role_filter": {
                 "type": "string",
                 "enum": ["user", "assistant", "tool"],
-                "description": "Filter deep messages by role. 'user' = only user messages. 'assistant' = only assistant/agent replies. 'tool' = only tool outputs. Omit or pass null to search all roles.",
+                "description": "Filter deep messages by role. 'user' = only user messages. 'assistant' = only assistant/agent replies. 'tool' = only tool outputs. Omit or pass null for the default (user + assistant, tool output excluded).",
             },
             "debug": {
                 "type": "boolean",
@@ -359,8 +361,14 @@ class SnowSearchEngine:
         self._hermes_home = get_hermes_home()
 
         # --- deep search config ---
-        self._deep_enabled = config.get("deep_search_enabled", _DEFAULT_DEEP_ENABLED)
-        # deep_search_load_mode is deprecated — FTS5 mode has no load step
+        # deep_search_load_mode (off|startup|ondemand, default startup) is the
+        # sole control: "off" disables deep search; "startup" preloads it at
+        # boot; "ondemand" loads lazily on the first query.
+        mode = config.get("deep_search_load_mode", _DEFAULT_DEEP_LOAD_MODE)
+        if mode not in ("off", "startup", "ondemand"):
+            mode = _DEFAULT_DEEP_LOAD_MODE
+        self._deep_mode = mode
+        self._deep_enabled = mode != "off"
 
         # --- data (lazy loaded) ---
         self._ready = False
@@ -656,6 +664,10 @@ class SnowSearchEngine:
             return [], 0
 
         try:
+            # Empty query + time range: range scan without MATCH.
+            if not query or not query.strip():
+                return self._search_deep_range(db, role_filter, start_ts, end_ts, sort, limit)
+
             is_cjk = bool(_CJK_RE.search(query))
             cjk_count = self._count_cjk(query)
             if is_cjk and cjk_count >= 3 and not self._has_short_cjk_token(query):
@@ -671,10 +683,13 @@ class SnowSearchEngine:
             where = [f"{table} MATCH ?"]
             params: list = [fts_query]
             where.append("s.parent_session_id IS NULL")
-            where.append("m.role IN ('user','assistant')")
             if role_filter:
                 where.append("m.role = ?")
                 params.append(role_filter)
+            else:
+                # Default: exclude tool output (mostly duplicate JSON) unless
+                # role_filter explicitly asks for it.
+                where.append("m.role IN ('user','assistant')")
             if start_ts is not None:
                 where.append("m.timestamp >= ?")
                 params.append(start_ts)
@@ -746,10 +761,11 @@ class SnowSearchEngine:
         esc = "%" + query.replace("%", "\\%").replace("_", "\\_") + "%"
         params: list = [esc]
         where.append("s.parent_session_id IS NULL")
-        where.append("m.role IN ('user','assistant')")
         if role_filter:
             where.append("m.role = ?")
             params.append(role_filter)
+        else:
+            where.append("m.role IN ('user','assistant')")
         if start_ts is not None:
             where.append("m.timestamp >= ?")
             params.append(start_ts)
@@ -772,6 +788,67 @@ class SnowSearchEngine:
             ).fetchall()
         except Exception as e:
             logger.debug("snow-search LIKE fallback failed: %s", e)
+            return [], 0
+
+        hits = []
+        n = len(rows)
+        for i, r in enumerate(rows):
+            score = round(1.0 - (0.5 * i / n) if n > 0 else 1.0, 3)
+            hits.append({
+                "source": "deep_messages",
+                "score": score,
+                "confidence": "high" if score >= 0.7 else ("medium" if score >= 0.5 else "low"),
+                "content": r[3][:2000],
+                "session_id": r[1],
+                "timestamp": r[4],
+                "role": r[2],
+            })
+        return hits, exact_total
+
+    def _search_deep_range(
+        self, db, role_filter, start_ts, end_ts, sort: str, limit: int
+    ) -> tuple[list, int]:
+        """Time-range scan with no text predicate (empty query + range filter).
+
+        No MATCH/LIKE — pure timestamp + role filtering against the messages
+        table. Used when the caller passes a window with no query keywords.
+        """
+        where = ["s.parent_session_id IS NULL"]
+        params: list = []
+        if role_filter:
+            where.append("m.role = ?")
+            params.append(role_filter)
+        else:
+            where.append("m.role IN ('user','assistant')")
+        if start_ts is not None:
+            where.append("m.timestamp >= ?")
+            params.append(start_ts)
+        if end_ts is not None:
+            where.append("m.timestamp < ?")
+            params.append(end_ts)
+        where_sql = " AND ".join(where)
+
+        # No query → no relevance signal; fall back to time order. 'relevance'
+        # without a query would be arbitrary, so treat it as newest.
+        if sort == "oldest":
+            order = "m.timestamp ASC, m.id ASC"
+        else:
+            order = "m.timestamp DESC, m.id DESC"
+
+        try:
+            exact_total = db._conn.execute(
+                f"SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id "
+                f"WHERE {where_sql}",
+                params,
+            ).fetchone()[0]
+            rows = db._conn.execute(
+                f"SELECT m.id, m.session_id, m.role, m.content, m.timestamp "
+                f"FROM messages m JOIN sessions s ON s.id = m.session_id "
+                f"WHERE {where_sql} ORDER BY {order} LIMIT ?",
+                params + [max(limit, limit * 3)],
+            ).fetchall()
+        except Exception as e:
+            logger.debug("snow-search range scan failed: %s", e)
             return [], 0
 
         hits = []
@@ -1567,6 +1644,9 @@ class SnowSearchEngine:
         if deep:
             self._ensure_facts_and_memory()
             self._ensure_deep_loaded()
+            # Ensure sessions/skills/soul are also loaded (bail out if background
+            # eager load failed or hasn't finished yet).
+            self._ensure_loaded()
         else:
             self._ensure_loaded()
 
@@ -1666,7 +1746,7 @@ class SnowSearchEngine:
             else:
                 mem_stores[store_name] = data
 
-        if fts_stores and query_tokens:
+        if fts_stores and (query_tokens or has_time_filter):
             try:
                 fts_hits, fts_exact = self._search_deep_fts(
                     query=query,
@@ -1745,7 +1825,7 @@ class SnowSearchEngine:
                 "sessions": bool(self._sessions),
                 "facts": bool(self._facts),
                 "memory": bool(self._memory_entries),
-                "deep_messages": bool(self._deep_messages),
+                "deep_messages": self._deep_enabled and (self._use_fts or bool(self._deep_messages)),
             },
             "search_info": search_info,
         }

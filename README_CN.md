@@ -84,7 +84,7 @@ plugins:
     memory_limit_mb: 500          # 轻量源上限（sessions/facts/memory/skills）
     session_max: 7000
     fact_max: 10000
-    deep_search_enabled: true     # 设为 false 关闭深度搜索
+    deep_search_load_mode: startup  # off | startup | ondemand
 ```
 
 | 配置项 | 默认值 | 说明 |
@@ -92,7 +92,7 @@ plugins:
 | `memory_limit_mb` | 500 | 轻量源上限。深度搜索走 FTS5（数据库侧），不计入此上限 |
 | `session_max` | 7000 | 轻量缓存最大 session 数 |
 | `fact_max` | 10000 | 最大事实条目数 |
-| `deep_search_enabled` | true | 开启完整消息正文搜索（FTS5） |
+| `deep_search_load_mode` | `startup` | 深度搜索行为：`off`（关闭）、`startup`（启动预加载）、`ondemand`（首次查询懒加载） |
 
 > `memory_limit_mb` 仅约束轻量源。深度搜索复用数据库已有的 FTS5 索引——零额外内存。
 
